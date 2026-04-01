@@ -11,9 +11,5 @@
     "refresh_token": "your_etsy_refresh_token",
     "shop_id": "your_shop_id"
   },
-  "sku_mapping": {
-    "WC-SKU-001": "1234567890",
-    "WC-SKU-002": "0987654321"
-  },
   "write": false
 }
