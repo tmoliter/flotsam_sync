@@ -1,0 +1,19 @@
+{
+  "woocommerce": {
+    "url": "https://your-store.com",
+    "consumer_key": "your_woocommerce_consumer_key",
+    "consumer_secret": "your_woocommerce_consumer_secret"
+  },
+  "etsy": {
+    "api_key": "your_etsy_keystring",
+    "shared_secret": "your_etsy_shared_secret",
+    "access_token": "your_etsy_access_token",
+    "refresh_token": "your_etsy_refresh_token",
+    "shop_id": "your_shop_id"
+  },
+  "sku_mapping": {
+    "WC-SKU-001": "1234567890",
+    "WC-SKU-002": "0987654321"
+  },
+  "write": false
+}

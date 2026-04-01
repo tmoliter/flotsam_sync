@@ -1,0 +1,18 @@
+# Sensitive files - DO NOT COMMIT
+config.json
+*log*
+db.json
+/backups
+*stuff*
+
+# Python
+*.pyc
+__pycache__/
+
+
+# misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
