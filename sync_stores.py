@@ -128,6 +128,7 @@ ETSY_REFRESH_TOKEN = CONFIG.get("etsy", {}).get("refresh_token", "")
 ETSY_SHOP_ID = CONFIG.get("etsy", {}).get("shop_id", "")
 
 WRITE = CONFIG.get("write", False)
+TEST_ITEMS_ONLY = CONFIG.get("test_items_only", False)
 
 
 # Validate configuration
@@ -417,7 +418,7 @@ def cleanup_old_backups(days_to_keep=21):
 class APIException(Exception):
     pass
 
-def update_etsy(new_stock):
+def update_etsy(etsy_stock: EtsyStock, new_stock: int):
     if not WRITE:
         logging.info(f"WRITE flag is False. Skipping Etsy update to {new_stock}")
         return "skipped"
@@ -431,22 +432,38 @@ def update_etsy(new_stock):
         raise APIException("Failed to update Etsy stock")
     return status
 
-def update_woo(new_stock):
-    if not WRITE:
-        logging.info(f"WRITE flag is False. Skipping WooCommerce update to {new_stock}")
-        return "skipped"
-    ### TODO! THIS NEEDS TO BE FILLED OUT
+def update_woo(woo_stock: WooStock, new_stock: int) -> int:
     logging.info(f"Updating WooCommerce stock to {new_stock}")
-    # status = "failure"
-    status = "success"
-    if status == "failure":
-        raise APIException("Failed to update WooCommerce stock")
-    return status
+    if not WRITE:
+        logging.info(f"WRITE flag is False. Skipping WooCommerce update.")
+        return 200  # Return 200 to simulate successful update for testing purposes
+    try:
+        url = f"{WC_URL}/wp-json/wc/v3/products/{woo_stock.product_id}/variations/{woo_stock.variation_id}"
+        data = {
+            "stock_quantity": new_stock
+        }
+        response = requests.post(
+            url, json=data, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30
+        )
+        response.raise_for_status()
+        updated_stock = response.json().get("stock_quantity")
+        status_code = response.status_code
+        if status_code == 200 and updated_stock == new_stock:
+            logging.info(f"Successfully updated WooCommerce stock to {updated_stock} for product ID {woo_stock.product_id}, variation ID {woo_stock.variation_id}")
+        else:
+            logging.error(f"Failed to update WooCommerce stock. Status Code: {status_code}, Response: {response.text}")
+        return status_code
+    except requests.exceptions.RequestException as e:
+        logging.exception(f"Error updating WooCommerce stock: {e}")
+        return 500
+    
 
 def make_updates(sku_to_stock_items: dict[str, StockItem]) -> None:
     fake_ass_database = get_db()
     try:
         for sku, stock_item in sku_to_stock_items.items():
+            if TEST_ITEMS_ONLY and sku != "test_item":
+                continue
             logging.info("==============================")
             logging.info(f"Processing SKU: {sku}, Name: {stock_item.name}, Woo IDs: {stock_item.woo_stock.product_id}/{stock_item.woo_stock.variation_id}, Etsy IDs: {stock_item.etsy_stock.listing_id}/{stock_item.etsy_stock.product_id}")
             try:
@@ -456,7 +473,7 @@ def make_updates(sku_to_stock_items: dict[str, StockItem]) -> None:
                     logging.info(f"SKU {sku} not in database")
                     if woo_stock_quantity != etsy_stock_quantity:
                         logging.info("SKU not in database and Woo is discrepant from Etsy: Updating Woo")
-                        update_woo(etsy_stock_quantity)
+                        update_woo(stock_item.woo_stock, etsy_stock_quantity)
                     fake_ass_database[sku] = etsy_stock_quantity
                     continue
 
@@ -473,7 +490,7 @@ def make_updates(sku_to_stock_items: dict[str, StockItem]) -> None:
                     logging.info(f"Positive Etsy diff = {etsy_diff}. Updating Woo.")
                     if woo_diff != 0:
                         logging.warning(f"Etsy positive diff coexisting with woo diff, SKU: {sku}")
-                    update_woo(etsy_stock_quantity)
+                    update_woo(stock_item.woo_stock, etsy_stock_quantity)
                     fake_ass_database[sku] = etsy_stock_quantity
                     continue
 
@@ -481,7 +498,7 @@ def make_updates(sku_to_stock_items: dict[str, StockItem]) -> None:
                     logging.info(f"Positive Woo diff = {woo_diff}. Updating Etsy.")
                     if etsy_diff != 0:
                         logging.warning(f"Woo positive diff coexisting with etsy diff, SKU: {sku}")
-                    update_etsy(woo_stock_quantity)
+                    update_etsy(stock_item.etsy_stock, woo_stock_quantity)
                     fake_ass_database[sku] = woo_stock_quantity
                     continue
 
@@ -492,11 +509,9 @@ def make_updates(sku_to_stock_items: dict[str, StockItem]) -> None:
                     new_stock = 0
 
                 if etsy_diff != total_diff:
-                    logging.info(f"Updating Etsy.")
-                    update_etsy(new_stock)
+                    update_etsy(stock_item.etsy_stock, new_stock)
                 if woo_diff != total_diff:
-                    logging.info(f"Updating Woo.")
-                    update_woo(new_stock)
+                    update_woo(stock_item.woo_stock, new_stock)
                 fake_ass_database[sku] = new_stock
             except APIException as e:
                 logging.error(f"APIException occurred for SKU: {sku}. Skipping db writes. Error: {e}")
