@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import logging
+from typing import Any, Dict, List, Tuple
 import requests
 import os
 import sys
@@ -83,6 +84,19 @@ class StockItem:
 
     def __repr__(self):
         return f"<< ETSY: {self.etsy_stock.stock_quantity} | WOO: {self.woo_stock.stock_quantity} >>"
+    
+
+class GeneralProduct:
+    name: str
+    etsy_listing_id: int
+    sku_to_stock_items: Dict[str, StockItem]
+    etsy_products: List[Any]
+
+    def __init__(self, name, etsy_listing_id, sku_to_stock_items, etsy_products):
+        self.name = name
+        self.etsy_listing_id = etsy_listing_id
+        self.sku_to_stock_items = sku_to_stock_items
+        self.etsy_products = etsy_products
 
 ################
 ### Config
@@ -325,9 +339,9 @@ def get_all_etsy_listings(active=True, retry_on_auth_error=True):
     return response.json()
 
 
-def get_etsy_variants_stock(listing_id: int, retry_on_auth_error=True):
+def get_etsy_listing_products(listing_id: int, retry_on_auth_error=True):
     url = (
-        f"https://api.etsy.com/v3/application/listings/{listing_id}?includes=inventory"
+        f"https://api.etsy.com/v3/application/listings/{listing_id}/inventory"
     )
     logging.info(f"Fetching Etsy variants stock for listing ID: {listing_id}")
     headers = {
@@ -342,33 +356,51 @@ def get_etsy_variants_stock(listing_id: int, retry_on_auth_error=True):
         logging.warning("Etsy token appears to be expired. Attempting to refresh...")
         if refresh_etsy_token():
             # Retry with new token
-            return get_etsy_variants_stock(listing_id, retry_on_auth_error=False)
+            return get_etsy_listing_products(listing_id, retry_on_auth_error=False)
         else:
             logging.error("Failed to refresh token")
             return None
 
     response.raise_for_status()
 
-    ## Returns the whole response, we may want to extract just the stock
-    return response.json()
+    return response.json()["products"]
 
-def update_etsy(etsy_stock: EtsyStock, new_stock: int):
-    if not WRITE:
-        logging.info(f"WRITE flag is False. Skipping Etsy update to {new_stock}")
-        return "skipped"
-    ### TODO! THIS NEEDS TO BE FILLED OUT! 
-    ### MAKE SURE TO ONLY MAKE UPDATES TO TEST ITEMS AT FIRST!
+def update_etsy(general_product: GeneralProduct, sku_to_new_stock: Dict[str, int]) -> int:
     ### https://www.etsy.com/legal/policy/api-testing-policy/169130941112
-
-    ### YO THESE ARE THE MONEY DOCS!!! READ THIS!!!
     ### https://developers.etsy.com/documentation/tutorials/listings/#updating-inventory
-    logging.info(f"Updating Etsy stock to {new_stock}")
-    # status = "failure"
-    status = "success"
-    if status == "failure":
-        raise APIException("Failed to update Etsy stock")
-    return status
+    if not sku_to_new_stock:
+        logging.info(f"No Etsy updates to make for {general_product.name}. Skipping.")
+        return 200
+    if not WRITE:
+        logging.info(f"WRITE flag is False. Skipping Etsy update.")
+        return 200
 
+    products_copy = json.loads(json.dumps(general_product.etsy_products))
+    for i, product in enumerate(general_product.etsy_products):
+        if product["sku"] in sku_to_new_stock:
+            logging.info(f"Product {product['sku']} will be updated to new stock: {sku_to_new_stock[product['sku']]}")
+            products_copy[i]["offerings"][0]["quantity"] = sku_to_new_stock[product["sku"]]
+
+
+    url = f"https://api.etsy.com/v3/application/listings/{general_product.etsy_listing_id}/inventory"
+    headers = {
+        "x-api-key": ETSY_API_KEY,
+        "Authorization": f"Bearer {ETSY_ACCESS_TOKEN}",
+        "User-Agent": "FlotsamMade-WooCommerce-Etsy-Sync/1.0",
+        "Content-Type": "application/json",
+    }
+
+    data = {
+        "products": products_copy
+    }
+
+    logging.info(f"Updating Etsy stock for listing ID: {general_product.etsy_listing_id} with data: {data}")
+    response = requests.put(url, headers=headers, json=data, timeout=30)
+
+    print(response.status_code)
+    print(response.json())
+
+    return response.status_code
 
 
 ################
@@ -447,11 +479,8 @@ def update_woo(woo_stock: WooStock, new_stock: int) -> int:
 ################
 ### Business Logic
 ################
-def get_stock_items() -> dict[str, StockItem]:
+def get_general_products() -> List[GeneralProduct]:
     sku_to_woo_stock = get_woocommerce_stock()
-
-    ### ETSY DOCS - Reference again for writes!
-    ### https://developers.etsy.com/documentation/reference/#operation/getListingsByShop
 
     active_listings = get_all_etsy_listings()
     sold_out_listings = get_all_etsy_listings(active=False)
@@ -463,13 +492,16 @@ def get_stock_items() -> dict[str, StockItem]:
         if any([sku in sku_to_woo_stock.keys() for sku in listing["skus"]])
     ]
 
-    sku_to_stock_items: dict[str, StockItem] = {}
+    general_products: List[GeneralProduct] = []
     bad_skus = set()
 
     for listing in has_woo_skus:
         logging.info(f"{listing['listing_id']}: {listing['title']}")
-        res = get_etsy_variants_stock(listing["listing_id"])
-        for sub_product in res["inventory"]["products"]:
+        sku_to_stock_items: Dict[str, StockItem] = {}
+        products = get_etsy_listing_products(listing["listing_id"])
+        for sub_product in products:
+            if TEST_ITEMS_ONLY and not sub_product["sku"].startswith("test"):
+                continue
             if sub_product["sku"] in sku_to_stock_items:
                 continue
             if sub_product["sku"] in bad_skus:
@@ -492,65 +524,80 @@ def get_stock_items() -> dict[str, StockItem]:
                 woo_stock=sku_to_woo_stock[sub_product["sku"]],
                 etsy_stock=etsy_stock_item,
             )
-    
-    return sku_to_stock_items
+        if sku_to_stock_items:
+            general_products.append(
+                GeneralProduct(
+                    name=listing["title"],
+                    etsy_listing_id=listing["listing_id"],
+                    sku_to_stock_items=sku_to_stock_items,
+                    etsy_products=products,
+                )
+            )
+
+    return general_products
 
 
-def make_updates(sku_to_stock_items: dict[str, StockItem]) -> None:
+def make_updates(general_products: List[GeneralProduct]) -> None:
     fake_ass_database = get_db()
     try:
-        for sku, stock_item in sku_to_stock_items.items():
-            if TEST_ITEMS_ONLY and sku != "test_item":
-                continue
-            logging.info("==============================")
-            logging.info(f"Processing SKU: {sku}, Name: {stock_item.name}, Woo IDs: {stock_item.woo_stock.product_id}/{stock_item.woo_stock.variation_id}, Etsy IDs: {stock_item.etsy_stock.listing_id}/{stock_item.etsy_stock.product_id}")
+        for general_product in general_products:
+            logging.info("===============================================")
+            logging.info(f"Processing SKUs for Etsy Product ID {general_product.etsy_listing_id}")
+            etsy_updates: Dict[str, int] = {} # SKU to new stock
             try:
-                woo_stock_quantity = stock_item.woo_stock.stock_quantity
-                etsy_stock_quantity = stock_item.etsy_stock.stock_quantity
-                if sku not in fake_ass_database:
-                    logging.info(f"SKU {sku} not in database")
-                    if woo_stock_quantity != etsy_stock_quantity:
-                        logging.info("SKU not in database and Woo is discrepant from Etsy: Updating Woo")
+                for sku, stock_item in general_product.sku_to_stock_items.items():
+                    if TEST_ITEMS_ONLY and not sku.startswith("test_item"):
+                        continue
+                    logging.info("--------------------------")
+                    logging.info(f"Processing SKU: {sku}, Name: {stock_item.name}, Woo IDs: {stock_item.woo_stock.product_id}/{stock_item.woo_stock.variation_id}, Etsy IDs: {stock_item.etsy_stock.listing_id}/{stock_item.etsy_stock.product_id}")
+                    woo_stock_quantity = stock_item.woo_stock.stock_quantity
+                    etsy_stock_quantity = stock_item.etsy_stock.stock_quantity
+                    if sku not in fake_ass_database:
+                        logging.info(f"SKU {sku} not in database")
+                        if woo_stock_quantity != etsy_stock_quantity:
+                            logging.info("SKU not in database and Woo is discrepant from Etsy: Updating Woo")
+                            update_woo(stock_item.woo_stock, etsy_stock_quantity)
+                        fake_ass_database[sku] = etsy_stock_quantity
+                        continue
+
+                    etsy_diff = etsy_stock_quantity - fake_ass_database[sku]
+                    woo_diff = woo_stock_quantity - fake_ass_database[sku]
+                    logging.info(f"Database stock = {fake_ass_database[sku]} | Etsy stock = {etsy_stock_quantity} | Woo stock = {woo_stock_quantity}")
+                    logging.info(f"Etsy diff = {etsy_diff} | Woo diff = {woo_diff}")
+
+                    if etsy_diff == 0 and woo_diff == 0:
+                        logging.info(f"No differences found for SKU: {sku}")
+                        continue
+
+                    if etsy_diff > 0:
+                        logging.info(f"Positive Etsy diff = {etsy_diff}. Updating Woo.")
+                        if woo_diff != 0:
+                            logging.warning(f"Etsy positive diff coexisting with woo diff, SKU: {sku}")
                         update_woo(stock_item.woo_stock, etsy_stock_quantity)
-                    fake_ass_database[sku] = etsy_stock_quantity
-                    continue
+                        fake_ass_database[sku] = etsy_stock_quantity
+                        continue
 
-                etsy_diff = etsy_stock_quantity - fake_ass_database[sku]
-                woo_diff = woo_stock_quantity - fake_ass_database[sku]
-                logging.info(f"Database stock = {fake_ass_database[sku]} | Etsy stock = {etsy_stock_quantity} | Woo stock = {woo_stock_quantity}")
-                logging.info(f"Etsy diff = {etsy_diff} | Woo diff = {woo_diff}")
+                    if woo_diff > 0:
+                        logging.info(f"Positive Woo diff = {woo_diff}. Updating Etsy.")
+                        if etsy_diff != 0:
+                            logging.warning(f"Woo positive diff coexisting with etsy diff, SKU: {sku}")
+                        etsy_updates[sku] = woo_stock_quantity
+                        fake_ass_database[sku] = woo_stock_quantity
+                        continue
 
-                if etsy_diff == 0 and woo_diff == 0:
-                    logging.info(f"No differences found for SKU: {sku}")
-                    continue
+                    total_diff = etsy_diff + woo_diff
+                    new_stock = fake_ass_database[sku] + total_diff
+                    if new_stock < 0:
+                        logging.error(f"New stock for SKU: {sku} is negative. Alerting to Amy.")
+                        new_stock = 0
 
-                if etsy_diff > 0:
-                    logging.info(f"Positive Etsy diff = {etsy_diff}. Updating Woo.")
-                    if woo_diff != 0:
-                        logging.warning(f"Etsy positive diff coexisting with woo diff, SKU: {sku}")
-                    update_woo(stock_item.woo_stock, etsy_stock_quantity)
-                    fake_ass_database[sku] = etsy_stock_quantity
-                    continue
+                    if etsy_diff != total_diff:
+                        etsy_updates[sku] = woo_stock_quantity
+                    if woo_diff != total_diff:
+                        update_woo(stock_item.woo_stock, new_stock)
+                    fake_ass_database[sku] = new_stock
 
-                if woo_diff > 0:
-                    logging.info(f"Positive Woo diff = {woo_diff}. Updating Etsy.")
-                    if etsy_diff != 0:
-                        logging.warning(f"Woo positive diff coexisting with etsy diff, SKU: {sku}")
-                    update_etsy(stock_item.etsy_stock, woo_stock_quantity)
-                    fake_ass_database[sku] = woo_stock_quantity
-                    continue
-
-                total_diff = etsy_diff + woo_diff
-                new_stock = fake_ass_database[sku] + total_diff
-                if new_stock < 0:
-                    logging.error(f"New stock for SKU: {sku} is negative. Alerting to Amy.")
-                    new_stock = 0
-
-                if etsy_diff != total_diff:
-                    update_etsy(stock_item.etsy_stock, new_stock)
-                if woo_diff != total_diff:
-                    update_woo(stock_item.woo_stock, new_stock)
-                fake_ass_database[sku] = new_stock
+                update_etsy(general_product, etsy_updates)
             except APIException as e:
                 logging.error(f"APIException occurred for SKU: {sku}. Skipping db writes. Error: {e}")
                 continue
@@ -561,8 +608,8 @@ def make_updates(sku_to_stock_items: dict[str, StockItem]) -> None:
 
 if __name__ == "__main__":
     cleanup()
-    sku_to_stock_items = get_stock_items()
-    make_updates(sku_to_stock_items)
+    general_products = get_general_products()
+    make_updates(general_products)
 
 
 # Cron
