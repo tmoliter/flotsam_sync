@@ -7,13 +7,17 @@ import sys
 import tempfile
 from datetime import datetime, timedelta
 
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.ERROR)
+log_name = datetime.now().strftime("./logs/logs_%Y-%m-%d_%H-%M.txt")
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("./logs.txt"),
-        logging.StreamHandler(),
+        logging.FileHandler(log_name),
+        stream_handler,
     ],
 )
 
@@ -21,6 +25,8 @@ logging.info("==============================")
 logging.info("Starting test script...")
 logging.info("==============================")
 
+class APIException(Exception):
+    pass
 
 class WooStock:
     name: str
@@ -78,7 +84,9 @@ class StockItem:
     def __repr__(self):
         return f"<< ETSY: {self.etsy_stock.stock_quantity} | WOO: {self.woo_stock.stock_quantity} >>"
 
-
+################
+### Config
+################
 def save_config(config, config_file):
     """Save configuration back to config.json file"""
     if config_file and os.path.exists(config_file):
@@ -140,6 +148,96 @@ if not all([WC_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET, ETSY_API_KEY, ETSY_SHOP
         "Required: WC_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET, ETSY_API_KEY, ETSY_SHOP_ID"
     )
     sys.exit(1)
+
+
+################
+### Database (db.json)
+################
+def get_db():
+    # Load in dictionary from db.json
+    # If db.json doesn't exist, create it with an empty dictionary
+    if not os.path.exists("db.json"):
+        logging.info("db.json not found, creating new one with empty dictionary")
+        with open("db.json", "w") as f:
+            json.dump({}, f)
+        return {}
+    
+    # If db.json exists but is empty, initialize it with an empty dictionary
+    if os.path.getsize("db.json") == 0:
+        logging.info("db.json is empty, initializing with empty dictionary")
+        with open("db.json", "w") as f:
+            json.dump({}, f)
+        return {}
+
+    logging.info("Loading stock data from db.json")
+    with open("db.json", "r") as f:
+        return json.load(f).get("items", {}) or {}
+    
+def write_backup_db(data):
+    # Write a backup of the db to backups/db_backup_MM_DD_YYYY.json if one does not exist
+    date_string = datetime.now().strftime("%m_%d_%Y")
+    hour = datetime.now().hour
+    backup_dir = f"backups/{date_string}"
+    if not os.path.exists(backup_dir):
+        os.makedirs(backup_dir)
+    # If a backup for the current hour already exists, return
+    
+    backup_path = os.path.join(backup_dir, f"db_backup_{date_string}_{hour}.json")
+    if os.path.exists(backup_path):
+        return
+    with open(backup_path, "w") as f:
+        json.dump(data, f, indent=4)
+
+def set_db(data):
+    if not WRITE:
+        logging.info("WRITE flag is False. Skipping writing to db.json")
+        return
+    logging.info("Saving updated stock data to db.json")
+    timestamp = datetime.now().isoformat()
+    data = {"last_updated": timestamp, "items": data}
+    fd, tmp_path = tempfile.mkstemp(dir=".", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp_path, "db.json")  # atomic on POSIX
+    write_backup_db(data)
+
+
+################
+### Data cleanup
+################
+def cleanup_old_backups(days_to_keep=14):
+    cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+    for dirname in os.listdir("backups"):
+        dirpath = os.path.join("backups", dirname)
+        if os.path.isdir(dirpath):
+            try:
+                backup_date = datetime.strptime(dirname, "%m_%d_%Y")
+                if backup_date < cutoff_date:
+                    for filename in os.listdir(dirpath):
+                        file_path = os.path.join(dirpath, filename)
+                        os.remove(file_path)
+                    os.rmdir(dirpath)
+                    logging.info(f"Deleted old backup directory: {dirpath}")
+            except ValueError:
+                logging.warning(f"Unexpected backup directory format: {dirname}")
+
+def cleanup_old_logs(days_to_keep=3):
+    cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+    for filename in os.listdir("./logs"):
+        if filename.startswith("logs_") and filename.endswith(".txt"):
+            try:
+                log_date_str = filename[len("logs_") : -len(".txt")]
+                log_date = datetime.strptime(log_date_str, "%Y-%m-%d_%H-%M")
+                if log_date < cutoff_date:
+                    os.remove(os.path.join("./logs", filename))
+                    logging.info(f"Deleted old log file: {filename}")
+            except ValueError:
+                logging.warning(f"Unexpected log file format: {filename}")
+
+def cleanup():
+    cleanup_old_backups()
+    cleanup_old_logs()
+
 
 ################
 ### Etsy
@@ -254,6 +352,24 @@ def get_etsy_variants_stock(listing_id: int, retry_on_auth_error=True):
     ## Returns the whole response, we may want to extract just the stock
     return response.json()
 
+def update_etsy(etsy_stock: EtsyStock, new_stock: int):
+    if not WRITE:
+        logging.info(f"WRITE flag is False. Skipping Etsy update to {new_stock}")
+        return "skipped"
+    ### TODO! THIS NEEDS TO BE FILLED OUT! 
+    ### MAKE SURE TO ONLY MAKE UPDATES TO TEST ITEMS AT FIRST!
+    ### https://www.etsy.com/legal/policy/api-testing-policy/169130941112
+
+    ### YO THESE ARE THE MONEY DOCS!!! READ THIS!!!
+    ### https://developers.etsy.com/documentation/tutorials/listings/#updating-inventory
+    logging.info(f"Updating Etsy stock to {new_stock}")
+    # status = "failure"
+    status = "success"
+    if status == "failure":
+        raise APIException("Failed to update Etsy stock")
+    return status
+
+
 
 ################
 ### Woo Commerce
@@ -301,8 +417,36 @@ def get_woocommerce_stock():
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching WooCommerce products: {e}")
         return {}
-    
 
+def update_woo(woo_stock: WooStock, new_stock: int) -> int:
+    logging.info(f"Updating WooCommerce stock to {new_stock}")
+    if not WRITE:
+        logging.info(f"WRITE flag is False. Skipping WooCommerce update.")
+        return 200  # Return 200 to simulate successful update for testing purposes
+    try:
+        url = f"{WC_URL}/wp-json/wc/v3/products/{woo_stock.product_id}/variations/{woo_stock.variation_id}"
+        data = {
+            "stock_quantity": new_stock
+        }
+        response = requests.post(
+            url, json=data, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30
+        )
+        response.raise_for_status()
+        updated_stock = response.json().get("stock_quantity")
+        status_code = response.status_code
+        if status_code == 200 and updated_stock == new_stock:
+            logging.info(f"Successfully updated WooCommerce stock to {updated_stock} for product ID {woo_stock.product_id}, variation ID {woo_stock.variation_id}")
+        else:
+            logging.error(f"Failed to update WooCommerce stock. Status Code: {status_code}, Response: {response.text}")
+        return status_code
+    except requests.exceptions.RequestException as e:
+        logging.exception(f"Error updating WooCommerce stock: {e}")
+        return 500
+
+
+################
+### Business Logic
+################
 def get_stock_items() -> dict[str, StockItem]:
     sku_to_woo_stock = get_woocommerce_stock()
 
@@ -351,112 +495,6 @@ def get_stock_items() -> dict[str, StockItem]:
     
     return sku_to_stock_items
 
-def get_db():
-    # Load in dictionary from db.json
-    # If db.json doesn't exist, create it with an empty dictionary
-    if not os.path.exists("db.json"):
-        logging.info("db.json not found, creating new one with empty dictionary")
-        with open("db.json", "w") as f:
-            json.dump({}, f)
-        return {}
-    
-    # If db.json exists but is empty, initialize it with an empty dictionary
-    if os.path.getsize("db.json") == 0:
-        logging.info("db.json is empty, initializing with empty dictionary")
-        with open("db.json", "w") as f:
-            json.dump({}, f)
-        return {}
-
-    logging.info("Loading stock data from db.json")
-    with open("db.json", "r") as f:
-        return json.load(f).get("items", {}) or {}
-    
-def write_backup_db(data):
-    # Write a backup of the db to backups/db_backup_MM_DD_YYYY.json if one does not exist
-    date_string = datetime.now().strftime("%m_%d_%Y")
-    hour = datetime.now().hour
-    backup_dir = f"backups/{date_string}"
-    if not os.path.exists(backup_dir):
-        os.makedirs(backup_dir)
-    # If a backup for the current hour already exists, return
-    
-    backup_path = os.path.join(backup_dir, f"db_backup_{date_string}_{hour}.json")
-    if os.path.exists(backup_path):
-        return
-    with open(backup_path, "w") as f:
-        json.dump(data, f, indent=4)
-
-def set_db(data):
-    if not WRITE:
-        logging.info("WRITE flag is False. Skipping writing to db.json")
-        return
-    logging.info("Saving updated stock data to db.json")
-    timestamp = datetime.now().isoformat()
-    data = {"last_updated": timestamp, "items": data}
-    fd, tmp_path = tempfile.mkstemp(dir=".", suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=4)
-    os.replace(tmp_path, "db.json")  # atomic on POSIX
-    write_backup_db(data)
-
-def cleanup_old_backups(days_to_keep=21):
-    cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-    for dirname in os.listdir("backups"):
-        dirpath = os.path.join("backups", dirname)
-        if os.path.isdir(dirpath):
-            try:
-                backup_date = datetime.strptime(dirname, "%m_%d_%Y")
-                if backup_date < cutoff_date:
-                    for filename in os.listdir(dirpath):
-                        file_path = os.path.join(dirpath, filename)
-                        os.remove(file_path)
-                    os.rmdir(dirpath)
-                    logging.info(f"Deleted old backup directory: {dirpath}")
-            except ValueError:
-                logging.warning(f"Unexpected backup directory format: {dirname}")
-
-class APIException(Exception):
-    pass
-
-def update_etsy(etsy_stock: EtsyStock, new_stock: int):
-    if not WRITE:
-        logging.info(f"WRITE flag is False. Skipping Etsy update to {new_stock}")
-        return "skipped"
-    ### TODO! THIS NEEDS TO BE FILLED OUT! 
-    ### MAKE SURE TO ONLY MAKE UPDATES TO TEST ITEMS AT FIRST!
-    ### https://www.etsy.com/legal/policy/api-testing-policy/169130941112
-    logging.info(f"Updating Etsy stock to {new_stock}")
-    # status = "failure"
-    status = "success"
-    if status == "failure":
-        raise APIException("Failed to update Etsy stock")
-    return status
-
-def update_woo(woo_stock: WooStock, new_stock: int) -> int:
-    logging.info(f"Updating WooCommerce stock to {new_stock}")
-    if not WRITE:
-        logging.info(f"WRITE flag is False. Skipping WooCommerce update.")
-        return 200  # Return 200 to simulate successful update for testing purposes
-    try:
-        url = f"{WC_URL}/wp-json/wc/v3/products/{woo_stock.product_id}/variations/{woo_stock.variation_id}"
-        data = {
-            "stock_quantity": new_stock
-        }
-        response = requests.post(
-            url, json=data, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30
-        )
-        response.raise_for_status()
-        updated_stock = response.json().get("stock_quantity")
-        status_code = response.status_code
-        if status_code == 200 and updated_stock == new_stock:
-            logging.info(f"Successfully updated WooCommerce stock to {updated_stock} for product ID {woo_stock.product_id}, variation ID {woo_stock.variation_id}")
-        else:
-            logging.error(f"Failed to update WooCommerce stock. Status Code: {status_code}, Response: {response.text}")
-        return status_code
-    except requests.exceptions.RequestException as e:
-        logging.exception(f"Error updating WooCommerce stock: {e}")
-        return 500
-    
 
 def make_updates(sku_to_stock_items: dict[str, StockItem]) -> None:
     fake_ass_database = get_db()
@@ -522,6 +560,7 @@ def make_updates(sku_to_stock_items: dict[str, StockItem]) -> None:
     set_db(fake_ass_database)
 
 if __name__ == "__main__":
+    cleanup()
     sku_to_stock_items = get_stock_items()
     make_updates(sku_to_stock_items)
 

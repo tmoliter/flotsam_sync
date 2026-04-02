@@ -1,6 +1,7 @@
 # Sensitive files - DO NOT COMMIT
 config.json
 *log*
+/logs
 db.json
 /backups
 *stuff*
