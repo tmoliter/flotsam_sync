@@ -91,12 +91,18 @@ class GeneralProduct:
     etsy_listing_id: int
     sku_to_stock_items: Dict[str, StockItem]
     etsy_products: List[Any]
+    price_on_property: List[Any]
+    quantity_on_property: List[Any]
+    sku_on_property: List[Any]
 
-    def __init__(self, name, etsy_listing_id, sku_to_stock_items, etsy_products):
+    def __init__(self, name, etsy_listing_id, sku_to_stock_items, etsy_products, price_on_property, quantity_on_property, sku_on_property):
         self.name = name
         self.etsy_listing_id = etsy_listing_id
         self.sku_to_stock_items = sku_to_stock_items
         self.etsy_products = etsy_products
+        self.price_on_property = price_on_property
+        self.quantity_on_property = quantity_on_property
+        self.sku_on_property = sku_on_property
 
 ################
 ### Config
@@ -363,7 +369,7 @@ def get_etsy_listing_products(listing_id: int, retry_on_auth_error=True):
 
     response.raise_for_status()
 
-    return response.json()["products"]
+    return response.json()
 
 def update_etsy(general_product: GeneralProduct, sku_to_new_stock: Dict[str, int]) -> int:
     ### https://www.etsy.com/legal/policy/api-testing-policy/169130941112
@@ -377,6 +383,14 @@ def update_etsy(general_product: GeneralProduct, sku_to_new_stock: Dict[str, int
 
     products_copy = json.loads(json.dumps(general_product.etsy_products))
     for i, product in enumerate(general_product.etsy_products):
+        del products_copy[i]["product_id"]
+        del products_copy[i]["is_deleted"]
+        del products_copy[i]["offerings"][0]["offering_id"]
+        del products_copy[i]["offerings"][0]["is_deleted"]
+        for pv in products_copy[i]["property_values"]:
+            del pv["scale_name"]
+        products_copy[i]["offerings"][0]["price"] = products_copy[i]["offerings"][0]["price"]["amount"] / 100
+        
         if product["sku"] in sku_to_new_stock:
             logging.info(f"Product {product['sku']} will be updated to new stock: {sku_to_new_stock[product['sku']]}")
             products_copy[i]["offerings"][0]["quantity"] = sku_to_new_stock[product["sku"]]
@@ -391,14 +405,17 @@ def update_etsy(general_product: GeneralProduct, sku_to_new_stock: Dict[str, int
     }
 
     data = {
-        "products": products_copy
+        "products": products_copy,
+        "price_on_property": general_product.price_on_property,
+        "quantity_on_property": general_product.quantity_on_property,
+        "sku_on_property": general_product.sku_on_property,
     }
 
     logging.info(f"Updating Etsy stock for listing ID: {general_product.etsy_listing_id} with data: {data}")
     response = requests.put(url, headers=headers, json=data, timeout=30)
 
-    print(response.status_code)
-    print(response.json())
+    if response.status_code != 200:
+        raise APIException(f"Unexpected Etsy response for listing ID {general_product.etsy_listing_id}: Status Code: {response.status_code}, Response: {response.text}")
 
     return response.status_code
 
@@ -410,7 +427,7 @@ def get_variation_to_stock_map(product_id: int, product_name: str) -> dict[str, 
     logging.info(f"Fetching Woo variations for product ID: {product_id}")
     var_url = f"{WC_URL}/wp-json/wc/v3/products/{product_id}/variations"
     var_response = requests.get(
-        var_url, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30
+        var_url, params={"per_page": 100}, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30
     )
     var_response.raise_for_status()
     variations = var_response.json()
@@ -469,7 +486,7 @@ def update_woo(woo_stock: WooStock, new_stock: int) -> int:
         if status_code == 200 and updated_stock == new_stock:
             logging.info(f"Successfully updated WooCommerce stock to {updated_stock} for product ID {woo_stock.product_id}, variation ID {woo_stock.variation_id}")
         else:
-            logging.error(f"Failed to update WooCommerce stock. Status Code: {status_code}, Response: {response.text}")
+            raise APIException(f"Unexpected Woo response for sku {woo_stock.sku}: Status Code: {status_code}, Response: {response.text}")
         return status_code
     except requests.exceptions.RequestException as e:
         logging.exception(f"Error updating WooCommerce stock: {e}")
@@ -498,7 +515,11 @@ def get_general_products() -> List[GeneralProduct]:
     for listing in has_woo_skus:
         logging.info(f"{listing['listing_id']}: {listing['title']}")
         sku_to_stock_items: Dict[str, StockItem] = {}
-        products = get_etsy_listing_products(listing["listing_id"])
+        inventory = get_etsy_listing_products(listing["listing_id"])
+        products = inventory["products"]
+        price_on_property = inventory.get("price_on_property", [])
+        quantity_on_property = inventory.get("quantity_on_property", [])
+        sku_on_property = inventory.get("sku_on_property", [])
         for sub_product in products:
             if TEST_ITEMS_ONLY and not sub_product["sku"].startswith("test"):
                 continue
@@ -531,6 +552,9 @@ def get_general_products() -> List[GeneralProduct]:
                     etsy_listing_id=listing["listing_id"],
                     sku_to_stock_items=sku_to_stock_items,
                     etsy_products=products,
+                    price_on_property=price_on_property,
+                    quantity_on_property=quantity_on_property,
+                    sku_on_property=sku_on_property,
                 )
             )
 
@@ -546,7 +570,7 @@ def make_updates(general_products: List[GeneralProduct]) -> None:
             etsy_updates: Dict[str, int] = {} # SKU to new stock
             try:
                 for sku, stock_item in general_product.sku_to_stock_items.items():
-                    if TEST_ITEMS_ONLY and not sku.startswith("test_item"):
+                    if TEST_ITEMS_ONLY and not sku.startswith("test"):
                         continue
                     logging.info("--------------------------")
                     logging.info(f"Processing SKU: {sku}, Name: {stock_item.name}, Woo IDs: {stock_item.woo_stock.product_id}/{stock_item.woo_stock.variation_id}, Etsy IDs: {stock_item.etsy_stock.listing_id}/{stock_item.etsy_stock.product_id}")
@@ -600,9 +624,10 @@ def make_updates(general_products: List[GeneralProduct]) -> None:
                 update_etsy(general_product, etsy_updates)
             except APIException as e:
                 logging.error(f"APIException occurred for SKU: {sku}. Skipping db writes. Error: {e}")
-                continue
+                raise e
     except Exception as e:
         logging.exception(f"An error occurred: {e}")
+        raise e
 
     set_db(fake_ass_database)
 
