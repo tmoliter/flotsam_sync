@@ -616,12 +616,15 @@ def make_updates(general_products: List[GeneralProduct]) -> None:
                         new_stock = 0
 
                     if etsy_diff != total_diff:
-                        etsy_updates[sku] = woo_stock_quantity
+                        logging.info(f"Etsy diff != total diff. Updating Etsy to {new_stock}.")
+                        etsy_updates[sku] = new_stock
                     if woo_diff != total_diff:
+                        logging.info(f"Woo diff != total diff. Updating Woo to {new_stock}.")
                         update_woo(stock_item.woo_stock, new_stock)
                     fake_ass_database[sku] = new_stock
 
                 update_etsy(general_product, etsy_updates)
+                set_db(fake_ass_database)
             except APIException as e:
                 logging.error(f"APIException occurred for SKU: {sku}. Skipping db writes. Error: {e}")
                 raise e
@@ -629,7 +632,6 @@ def make_updates(general_products: List[GeneralProduct]) -> None:
         logging.exception(f"An error occurred: {e}")
         raise e
 
-    set_db(fake_ass_database)
 
 if __name__ == "__main__":
     cleanup()
