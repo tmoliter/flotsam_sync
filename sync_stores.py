@@ -10,7 +10,8 @@ from datetime import datetime, timedelta
 
 stream_handler = logging.StreamHandler()
 stream_handler.setLevel(logging.ERROR)
-log_name = datetime.now().strftime("./logs/logs_%Y-%m-%d_%H-%M.txt")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+log_name = datetime.now().strftime(os.path.join(SCRIPT_DIR, "logs", "logs_%Y-%m-%d_%H-%M.txt"))
 
 # Configure logging
 logging.basicConfig(
@@ -167,6 +168,8 @@ if not all([WC_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET, ETSY_API_KEY, ETSY_SHOP
     logging.error(
         "Required: WC_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET, ETSY_API_KEY, ETSY_SHOP_ID"
     )
+    logging.error(f"WC_URL={'SET' if WC_URL else 'MISSING'}, WC_CONSUMER_KEY={'SET' if WC_CONSUMER_KEY else 'MISSING'}, WC_CONSUMER_SECRET={'SET' if WC_CONSUMER_SECRET else 'MISSING'}, ETSY_API_KEY={'SET' if ETSY_API_KEY else 'MISSING'}, ETSY_SHOP_ID={'SET' if ETSY_SHOP_ID else 'MISSING'}")
+    logging.shutdown()
     sys.exit(1)
 
 
@@ -176,28 +179,29 @@ if not all([WC_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET, ETSY_API_KEY, ETSY_SHOP
 def get_db():
     # Load in dictionary from db.json
     # If db.json doesn't exist, create it with an empty dictionary
-    if not os.path.exists("db.json"):
+    db_path = os.path.join(SCRIPT_DIR, "db.json")
+    if not os.path.exists(db_path):
         logging.info("db.json not found, creating new one with empty dictionary")
-        with open("db.json", "w") as f:
+        with open(db_path, "w") as f:
             json.dump({}, f)
         return {}
     
     # If db.json exists but is empty, initialize it with an empty dictionary
-    if os.path.getsize("db.json") == 0:
+    if os.path.getsize(db_path) == 0:
         logging.info("db.json is empty, initializing with empty dictionary")
-        with open("db.json", "w") as f:
+        with open(db_path, "w") as f:
             json.dump({}, f)
         return {}
 
     logging.info("Loading stock data from db.json")
-    with open("db.json", "r") as f:
+    with open(db_path, "r") as f:
         return json.load(f).get("items", {}) or {}
     
 def write_backup_db(data):
     # Write a backup of the db to backups/db_backup_MM_DD_YYYY.json if one does not exist
     date_string = datetime.now().strftime("%m_%d_%Y")
     hour = datetime.now().hour
-    backup_dir = f"backups/{date_string}"
+    backup_dir = os.path.join(SCRIPT_DIR, "backups", date_string)
     if not os.path.exists(backup_dir):
         os.makedirs(backup_dir)
     # If a backup for the current hour already exists, return
@@ -215,10 +219,11 @@ def set_db(data):
     logging.info("Saving updated stock data to db.json")
     timestamp = datetime.now().isoformat()
     data = {"last_updated": timestamp, "items": data}
-    fd, tmp_path = tempfile.mkstemp(dir=".", suffix=".json")
+    db_path = os.path.join(SCRIPT_DIR, "db.json")
+    fd, tmp_path = tempfile.mkstemp(dir=SCRIPT_DIR, suffix=".json")
     with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=4)
-    os.replace(tmp_path, "db.json")  # atomic on POSIX
+    os.replace(tmp_path, db_path)  # atomic on POSIX
     write_backup_db(data)
 
 
@@ -227,8 +232,9 @@ def set_db(data):
 ################
 def cleanup_old_backups(days_to_keep=14):
     cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-    for dirname in os.listdir("backups"):
-        dirpath = os.path.join("backups", dirname)
+    backups_dir = os.path.join(SCRIPT_DIR, "backups")
+    for dirname in os.listdir(backups_dir):
+        dirpath = os.path.join(backups_dir, dirname)
         if os.path.isdir(dirpath):
             try:
                 backup_date = datetime.strptime(dirname, "%m_%d_%Y")
@@ -243,13 +249,14 @@ def cleanup_old_backups(days_to_keep=14):
 
 def cleanup_old_logs(days_to_keep=3):
     cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-    for filename in os.listdir("./logs"):
+    logs_dir = os.path.join(SCRIPT_DIR, "logs")
+    for filename in os.listdir(logs_dir):
         if filename.startswith("logs_") and filename.endswith(".txt"):
             try:
                 log_date_str = filename[len("logs_") : -len(".txt")]
                 log_date = datetime.strptime(log_date_str, "%Y-%m-%d_%H-%M")
                 if log_date < cutoff_date:
-                    os.remove(os.path.join("./logs", filename))
+                    os.remove(os.path.join(logs_dir, filename))
                     logging.info(f"Deleted old log file: {filename}")
             except ValueError:
                 logging.warning(f"Unexpected log file format: {filename}")
@@ -423,7 +430,7 @@ def update_etsy(general_product: GeneralProduct, sku_to_new_stock: Dict[str, int
 ################
 ### Woo Commerce
 ################
-def get_variation_to_stock_map(product_id: int, product_name: str) -> dict[str, WooStock]:
+def get_variation_to_stock_map(product_id: int, product_name: str) -> Dict[str, WooStock]:
     logging.info(f"Fetching Woo variations for product ID: {product_id}")
     var_url = f"{WC_URL}/wp-json/wc/v3/products/{product_id}/variations"
     var_response = requests.get(
@@ -637,7 +644,3 @@ if __name__ == "__main__":
     cleanup()
     general_products = get_general_products()
     make_updates(general_products)
-
-
-# Cron
-# 	/home/flotanzo/sync_script/test.py >> test_errors.txt 2>&1
