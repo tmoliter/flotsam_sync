@@ -4,6 +4,7 @@ config.json
 /logs
 db.json
 /backups
+sync.lock
 *stuff*
 
 # Python
@@ -17,3 +18,5 @@ __pycache__/
 .env.development.local
 .env.test.local
 .env.production.local
+
+.claude

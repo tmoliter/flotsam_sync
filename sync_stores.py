@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import fcntl
 import json
 import logging
+import resource
+import time
 from typing import Any, Dict, List, Tuple
 import requests
 import os
@@ -174,6 +177,55 @@ if not all([WC_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET, ETSY_API_KEY, ETSY_SHOP
 
 
 ################
+### HTTP sessions
+################
+USER_AGENT = "FlotsamMade-WooCommerce-Etsy-Sync/1.0"
+
+WOO_SESSION = requests.Session()
+WOO_SESSION.auth = (WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+WOO_SESSION.headers.update({"User-Agent": USER_AGENT})
+
+ETSY_SESSION = requests.Session()
+ETSY_SESSION.headers.update(
+    {
+        "x-api-key": ETSY_API_KEY,
+        "Authorization": f"Bearer {ETSY_ACCESS_TOKEN}",
+        "User-Agent": USER_AGENT,
+    }
+)
+
+
+################
+### Single-run lock
+################
+def acquire_lock():
+    """Take an exclusive lock so overlapping cron runs can't stack up.
+
+    Two runs at once burn CPU for nothing and race on db.json, since the
+    read-modify-write in make_updates() is not atomic across processes.
+    The returned handle must stay open for the life of the process.
+    """
+    lock_path = os.path.join(SCRIPT_DIR, "sync.lock")
+    lock_handle = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logging.warning("Another sync run is still in progress. Exiting.")
+        lock_handle.close()
+        logging.shutdown()
+        sys.exit(0)
+    return lock_handle
+
+
+def log_resource_usage(start_wall: float) -> None:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    cpu_seconds = usage.ru_utime + usage.ru_stime
+    logging.info(
+        f"Run finished: {cpu_seconds:.2f}s CPU, {time.monotonic() - start_wall:.1f}s wall"
+    )
+
+
+################
 ### Database (db.json)
 ################
 def get_db():
@@ -269,6 +321,47 @@ def cleanup():
 ################
 ### Etsy
 ################
+# Etsy v3 allows 10 requests/second. Before connection pooling, the TLS handshake
+# on every call spaced requests out by accident; now they fire back to back, so the
+# throttle has to be explicit. Sleeping costs wall time, not CPU.
+ETSY_MIN_REQUEST_INTERVAL = 0.15  # ~6-7 req/s
+ETSY_MAX_ATTEMPTS = 4
+_last_etsy_request = 0.0
+
+
+def etsy_request(method: str, url: str, **kwargs):
+    """Throttled Etsy call that backs off and retries on 429."""
+    global _last_etsy_request
+
+    for attempt in range(1, ETSY_MAX_ATTEMPTS + 1):
+        wait = ETSY_MIN_REQUEST_INTERVAL - (time.monotonic() - _last_etsy_request)
+        if wait > 0:
+            time.sleep(wait)
+
+        response = ETSY_SESSION.request(method, url, timeout=30, **kwargs)
+        _last_etsy_request = time.monotonic()
+
+        if response.status_code != 429:
+            return response
+
+        # Which ceiling did we hit? Etsy reports both in the response headers.
+        logging.warning(
+            f"Etsy 429 on {url} (attempt {attempt}/{ETSY_MAX_ATTEMPTS}) - "
+            f"remaining this second: {response.headers.get('x-remaining-this-second')}, "
+            f"remaining today: {response.headers.get('x-remaining-today')}"
+        )
+        if attempt == ETSY_MAX_ATTEMPTS:
+            break
+        try:
+            backoff = float(response.headers.get("Retry-After", 0)) or 2 ** attempt
+        except ValueError:
+            backoff = 2 ** attempt
+        logging.warning(f"Backing off {backoff}s")
+        time.sleep(backoff)
+
+    return response
+
+
 def refresh_etsy_token():
     """Refresh the Etsy access token using the refresh token"""
     global ETSY_ACCESS_TOKEN, ETSY_REFRESH_TOKEN, CONFIG
@@ -287,10 +380,12 @@ def refresh_etsy_token():
 
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "FlotsamMade-WooCommerce-Etsy-Sync/1.0",
+            "User-Agent": USER_AGENT,
         }
 
         logging.info("Refreshing Etsy access token...")
+        # Deliberately not ETSY_SESSION: this endpoint must not receive the
+        # (expired) bearer token the session carries. Happens once per run at most.
         response = requests.post(url, data=data, headers=headers, timeout=30)
         response.raise_for_status()
 
@@ -298,6 +393,10 @@ def refresh_etsy_token():
 
         # Update global variables
         ETSY_ACCESS_TOKEN = token_response["access_token"]
+
+        # The session holds its own copy of the Authorization header, so it has to
+        # be rewritten here or every later request keeps sending the dead token.
+        ETSY_SESSION.headers["Authorization"] = f"Bearer {ETSY_ACCESS_TOKEN}"
 
         # Update refresh token if a new one was provided
         if "refresh_token" in token_response:
@@ -326,15 +425,9 @@ def get_all_etsy_listings(active=True, retry_on_auth_error=True):
     """Fetch all listings from Etsy shop"""
     logging.info(f"Fetching {'active' if active else 'sold_out'} listings from Etsy...")
     url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/listings"
-    headers = {
-        "x-api-key": ETSY_API_KEY,
-        "Authorization": f"Bearer {ETSY_ACCESS_TOKEN}",
-        "User-Agent": "FlotsamMade-WooCommerce-Etsy-Sync/1.0",
-    }
-    response = requests.get(
+    response = etsy_request(
+        "GET",
         url,
-        headers=headers,
-        timeout=30,
         params={"limit": 100, "state": "active" if active else "sold_out"},
     )
 
@@ -357,12 +450,7 @@ def get_etsy_listing_products(listing_id: int, retry_on_auth_error=True):
         f"https://api.etsy.com/v3/application/listings/{listing_id}/inventory"
     )
     logging.info(f"Fetching Etsy variants stock for listing ID: {listing_id}")
-    headers = {
-        "x-api-key": ETSY_API_KEY,
-        "Authorization": f"Bearer {ETSY_ACCESS_TOKEN}",
-        "User-Agent": "FlotsamMade-WooCommerce-Etsy-Sync/1.0",
-    }
-    response = requests.get(url, headers=headers, timeout=30)
+    response = etsy_request("GET", url)
 
     # Check for auth errors (401 Unauthorized)
     if response.status_code == 401 and retry_on_auth_error:
@@ -404,13 +492,6 @@ def update_etsy(general_product: GeneralProduct, sku_to_new_stock: Dict[str, int
 
 
     url = f"https://api.etsy.com/v3/application/listings/{general_product.etsy_listing_id}/inventory"
-    headers = {
-        "x-api-key": ETSY_API_KEY,
-        "Authorization": f"Bearer {ETSY_ACCESS_TOKEN}",
-        "User-Agent": "FlotsamMade-WooCommerce-Etsy-Sync/1.0",
-        "Content-Type": "application/json",
-    }
-
     data = {
         "products": products_copy,
         "price_on_property": general_product.price_on_property,
@@ -419,7 +500,7 @@ def update_etsy(general_product: GeneralProduct, sku_to_new_stock: Dict[str, int
     }
 
     logging.info(f"Updating Etsy stock for listing ID: {general_product.etsy_listing_id} with data: {data}")
-    response = requests.put(url, headers=headers, json=data, timeout=30)
+    response = etsy_request("PUT", url, json=data)
 
     if response.status_code != 200:
         raise APIException(f"Unexpected Etsy response for listing ID {general_product.etsy_listing_id}: Status Code: {response.status_code}, Response: {response.text}")
@@ -433,9 +514,7 @@ def update_etsy(general_product: GeneralProduct, sku_to_new_stock: Dict[str, int
 def get_variation_to_stock_map(product_id: int, product_name: str) -> Dict[str, WooStock]:
     logging.info(f"Fetching Woo variations for product ID: {product_id}")
     var_url = f"{WC_URL}/wp-json/wc/v3/products/{product_id}/variations"
-    var_response = requests.get(
-        var_url, params={"per_page": 100}, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30
-    )
+    var_response = WOO_SESSION.get(var_url, params={"per_page": 100}, timeout=30)
     var_response.raise_for_status()
     variations = var_response.json()
     return {
@@ -456,9 +535,7 @@ def get_woocommerce_stock():
         url = f"{WC_URL}/wp-json/wc/v3/products"
         params = {"per_page": 100, "status": "publish"}  # Adjust as needed
 
-        response = requests.get(
-            url, params=params, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30
-        )
+        response = WOO_SESSION.get(url, params=params, timeout=30)
         response.raise_for_status()
 
         products = response.json()
@@ -484,9 +561,7 @@ def update_woo(woo_stock: WooStock, new_stock: int) -> int:
         data = {
             "stock_quantity": new_stock
         }
-        response = requests.post(
-            url, json=data, auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET), timeout=30
-        )
+        response = WOO_SESSION.post(url, json=data, timeout=30)
         response.raise_for_status()
         updated_stock = response.json().get("stock_quantity")
         status_code = response.status_code
@@ -641,6 +716,11 @@ def make_updates(general_products: List[GeneralProduct]) -> None:
 
 
 if __name__ == "__main__":
-    cleanup()
-    general_products = get_general_products()
-    make_updates(general_products)
+    lock_handle = acquire_lock()
+    start_wall = time.monotonic()
+    try:
+        cleanup()
+        general_products = get_general_products()
+        make_updates(general_products)
+    finally:
+        log_resource_usage(start_wall)
